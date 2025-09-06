@@ -20,6 +20,7 @@
 #include <crypto/siphash.h>
 #include <deploymentstatus.h>
 #include <flatfile.h>
+#include <gossip.h>
 #include <headerssync.h>
 #include <index/blockfilterindex.h>
 #include <kernel/chain.h>
@@ -412,10 +413,20 @@ struct Peer {
      * timestamp the peer sent in the version message. */
     std::atomic<std::chrono::seconds> m_time_offset{0s};
 
+    /** Gossip protocol data members */
+    mutable Mutex m_gossip_mutex;
+    /** Filter to track recently seen gossip message hashes to prevent rebroadcast */
+    std::unique_ptr<CRollingBloomFilter> m_gossip_known GUARDED_BY(m_gossip_mutex);
+    /** Rate limiter for gossip messages - tracks message count per minute */
+    std::chrono::microseconds m_last_gossip_time GUARDED_BY(m_gossip_mutex){0us};
+    /** Number of gossip messages received in current minute */
+    uint32_t m_gossip_message_count GUARDED_BY(m_gossip_mutex){0};
+
     explicit Peer(NodeId id, ServiceFlags our_services, bool is_inbound)
         : m_id{id}
         , m_our_services{our_services}
         , m_is_inbound{is_inbound}
+        , m_gossip_known{std::make_unique<CRollingBloomFilter>(10000, 0.000001)}
     {}
 
 private:
@@ -4905,6 +4916,64 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         }
         LOCK(m_tx_download_mutex);
         m_txdownloadman.ReceivedNotFound(pfrom.GetId(), tx_invs);
+        return;
+    }
+
+    if (msg_type == NetMsgType::GOSSIP) {
+        CGossipMessage gossip_msg;
+        vRecv >> gossip_msg;
+
+        if (!gossip_msg.IsValid()) {
+            LogDebug(BCLog::NET, "Invalid gossip message from peer=%d\n", pfrom.GetId());
+            return;
+        }
+
+        // Rate limiting check
+        {
+            LOCK(peer->m_gossip_mutex);
+            auto current_time = GetTime<std::chrono::microseconds>();
+            
+            // Reset counter if more than a minute has passed
+            if (current_time - peer->m_last_gossip_time >= 60000000us) { // 60 seconds in microseconds
+                peer->m_gossip_message_count = 0;
+                peer->m_last_gossip_time = current_time;
+            }
+
+            // Check rate limit
+            if (peer->m_gossip_message_count >= MAX_GOSSIP_RATE_PER_MINUTE) {
+                LogDebug(BCLog::NET, "Rate limited gossip message from peer=%d\n", pfrom.GetId());
+                return;
+            }
+
+            // Check if we've already seen this message
+            if (peer->m_gossip_known->contains(gossip_msg.hash)) {
+                LogDebug(BCLog::NET, "Duplicate gossip message from peer=%d\n", pfrom.GetId());
+                return;
+            }
+
+            // Record this message as seen
+            peer->m_gossip_known->insert(gossip_msg.hash);
+            peer->m_gossip_message_count++;
+        }
+
+        LogDebug(BCLog::NET, "Received gossip message topic='%s' from peer=%d\n", 
+                gossip_msg.topic, pfrom.GetId());
+
+        // Relay to other peers (simple flooding with seen-filter)
+        LOCK(m_peer_mutex);
+        for (auto& [peer_id, other_peer] : m_peer_map) {
+            if (peer_id == pfrom.GetId()) continue; // Don't relay back to sender
+            
+            LOCK(other_peer->m_gossip_mutex);
+            if (!other_peer->m_gossip_known->contains(gossip_msg.hash)) {
+                other_peer->m_gossip_known->insert(gossip_msg.hash);
+                CNode* pnode = m_connman.FindNode(peer_id);
+                if (pnode) {
+                    MakeAndPushMessage(*pnode, NetMsgType::GOSSIP, gossip_msg);
+                }
+            }
+        }
+
         return;
     }
 

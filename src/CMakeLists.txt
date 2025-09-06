@@ -186,6 +186,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   dbwrapper.cpp
   deploymentstatus.cpp
   flatfile.cpp
+  gossip.cpp
   headerssync.cpp
   httprpc.cpp
   httpserver.cpp
