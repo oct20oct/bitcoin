@@ -10,6 +10,7 @@
 #include <chainparams.h>
 #include <clientversion.h>
 #include <core_io.h>
+#include <gossip.h>
 #include <net_permissions.h>
 #include <net_processing.h>
 #include <net_types.h>
@@ -1192,6 +1193,65 @@ static RPCHelpMan getrawaddrman()
     };
 }
 
+static RPCHelpMan sendgossip()
+{
+    return RPCHelpMan{"sendgossip",
+        "\nSend a gossip message to the network.\n",
+        {
+            {"topic", RPCArg::Type::STR, RPCArg::Optional::NO, "Message topic/category"},
+            {"message", RPCArg::Type::STR, RPCArg::Optional::NO, "Message content (hex-encoded)"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR, "hash", "Hash of the gossip message"},
+                {RPCResult::Type::NUM, "peers", "Number of peers the message was sent to"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("sendgossip", "\"network_health\" \"48656c6c6f20576f726c64\"")
+            + HelpExampleRpc("sendgossip", "\"network_health\", \"48656c6c6f20576f726c64\"")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+            NodeContext& node_context = EnsureAnyNodeContext(request.context);
+            CConnman& connman = EnsureConnman(node_context);
+
+            std::string topic = request.params[0].get_str();
+            std::string hex_message = request.params[1].get_str();
+            
+            if (topic.empty()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Topic cannot be empty");
+            }
+            
+            if (topic.size() > 32) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Topic too long (max 32 characters)");
+            }
+
+            std::vector<unsigned char> data = ParseHex(hex_message);
+            if (data.size() > MAX_GOSSIP_MESSAGE_SIZE) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Message too large (max %d bytes)", MAX_GOSSIP_MESSAGE_SIZE));
+            }
+
+            CGossipMessage gossip_msg(topic, data);
+            if (!gossip_msg.IsValid()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid gossip message");
+            }
+
+            // Send to all connected peers
+            int peer_count = 0;
+            connman.ForEachNode([&](CNode* pnode) {
+                connman.PushMessage(pnode, NetMsg::Make(NetMsgType::GOSSIP, gossip_msg));
+                peer_count++;
+            });
+
+            UniValue ret(UniValue::VOBJ);
+            ret.pushKV("hash", gossip_msg.hash.ToString());
+            ret.pushKV("peers", peer_count);
+            return ret;
+        },
+    };
+}
+
 void RegisterNetRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -1213,6 +1273,7 @@ void RegisterNetRPCCommands(CRPCTable& t)
         {"hidden", &addpeeraddress},
         {"hidden", &sendmsgtopeer},
         {"hidden", &getrawaddrman},
+        {"network", &sendgossip},
     };
     for (const auto& c : commands) {
         t.appendCommand(c.name, &c);
